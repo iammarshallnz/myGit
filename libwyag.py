@@ -43,9 +43,12 @@ class GitRepository (object):
 class GitObject (object):
 
     def __init__(self, data=None):
+        
         if data != None:
+            self.init()
             self.deserialize(data)
         else:
+            # If no data is provided, we just initialize the object.
             self.init()
 
     def serialize(self, repo):
@@ -59,6 +62,7 @@ What exactly that means depend on each subclass.
         raise Exception("Unimplemented!")
 
     def deserialize(self, data):
+        
         raise Exception("Unimplemented!")
 
     def init(self):
@@ -72,6 +76,7 @@ class GitBlob(GitObject):
         return self.blobdata
 
     def deserialize(self, data):
+        
         self.blobdata = data
 
 
@@ -80,13 +85,34 @@ class GitCommit(GitObject):
     fmt=b'commit'
 
     def deserialize(self, data):
+        
         self.kvlm = kvlm_parse(data)
 
     def serialize(self):
         return kvlm_serialize(self.kvlm)
 
     def init(self):
+        
         self.kvlm = dict()
+
+
+class GitTreeLeaf (object):
+    def __init__(self, mode, path, sha):
+        self.mode = mode
+        self.path = path
+        self.sha = sha
+
+class GitTree(GitObject):
+    fmt=b'tree'
+
+    def deserialize(self, data):
+        self.items = tree_parse(data)
+
+    def serialize(self):
+        return tree_serialize(self)
+
+    def init(self):
+        self.items = list()
 
 # Helper functions
 def repo_path(repo, *path):
@@ -283,7 +309,7 @@ def cmd_hash_object(args):
         repo = repo_find()
     else:
         repo = None
-
+    
     with open(args.path, "rb") as fd:
         sha = object_hash(fd, args.type.encode(), repo)
         print(sha)
@@ -291,7 +317,7 @@ def cmd_hash_object(args):
 def object_hash(fd, fmt, repo=None):
     """ Hash object, writing it to repo if provided."""
     data = fd.read()
-
+    
     # Choose constructor according to fmt argument
     match fmt:
         case b'commit' : obj=GitCommit(data)
@@ -379,18 +405,187 @@ def kvlm_serialize(kvlm):
     return ret
 
 
+def cmd_log(args):
+    repo = repo_find()
+
+    print("digraph wyaglog{")
+    print("  node[shape=rect]")
+    log_graphviz(repo, object_find(repo, args.commit), set())
+    print("}")
+
+def log_graphviz(repo, sha, seen):
+
+    if sha in seen:
+        return
+    seen.add(sha)
+
+    commit = object_read(repo, sha)
+    if commit is None:  
+        raise Exception(f"Commit {sha} not found in repository {repo.gitdir}")
+    if not isinstance(commit, GitCommit): # if blob not kvlm
+        raise Exception(f"Object {sha} is not a commit, but a blob")    
+    message = commit.kvlm[None].decode("utf8").strip()  
+    message = message.replace("\\", "\\\\")
+    message = message.replace("\"", "\\\"")
+
+    if "\n" in message: # Keep only the first line
+        message = message[:message.index("\n")]
+
+    print(f"  c_{sha} [label=\"{sha[0:7]}: {message}\"]")
+    assert commit.fmt==b'commit'
+
+    if not b'parent' in commit.kvlm.keys():
+        # Base case: the initial commit.
+        return
+
+    parents = commit.kvlm[b'parent']
+
+    if type(parents) != list:
+        parents = [ parents ]
+
+    for p in parents:
+        p = p.decode("ascii")
+        print (f"  c_{sha} -> c_{p};")
+        log_graphviz(repo, p, seen)
+        
+# tree
+def tree_parse_one(raw, start=0):
+    # Find the space terminator of the mode
+    x = raw.find(b' ', start)
+    assert x-start == 5 or x-start==6
+
+    # Read the mode
+    mode = raw[start:x]
+    if len(mode) == 5:
+        # Normalize to six bytes.
+        mode = b"0" + mode
+
+    # Find the NULL terminator of the path
+    y = raw.find(b'\x00', x)
+    # and read the path
+    path = raw[x+1:y]
+
+    # Read the SHA…
+    raw_sha = int.from_bytes(raw[y+1:y+21], "big")
+    # and convert it into an hex string, padded to 40 chars
+    # with zeros if needed.
+    sha = format(raw_sha, "040x")
+    return y+21, GitTreeLeaf(mode, path.decode("utf8"), sha)
+
+
+
+def tree_parse(raw):
+    """ loops until input data is exhausted"""
+    pos = 0
+    max = len(raw)
+    ret = list()
+    while pos < max:
+        pos, data = tree_parse_one(raw, pos)
+        ret.append(data)
+
+    return ret
+
+# Notice this isn't a comparison function, but a conversion function.
+# Python's default sort doesn't accept a custom comparison function,
+# like in most languages, but a `key` arguments that returns a new
+# value, which is compared using the default rules.  So we just return
+# the leaf name, with an extra / if it's a directory.
+def tree_leaf_sort_key(leaf):
+    if leaf.mode.startswith(b"10"):
+        return leaf.path
+    else:
+        return leaf.path + "/"
+    
+    
+def tree_serialize(obj):
+    obj.items.sort(key=tree_leaf_sort_key)
+    ret = b''
+    for i in obj.items:
+        ret += i.mode
+        ret += b' '
+        ret += i.path.encode("utf8")
+        ret += b'\x00'
+        sha = int(i.sha, 16)
+        ret += sha.to_bytes(20, byteorder="big")
+    return ret
+
+def cmd_ls_tree(args):
+    repo = repo_find()
+    ls_tree(repo, args.tree, args.recursive)
+
+def ls_tree(repo, ref, recursive=None, prefix=""):
+    sha = object_find(repo, ref, fmt=b"tree")
+    obj = object_read(repo, sha)
+    if not isinstance(obj, GitTree):
+        raise Exception(f"Object {sha} is not a tree")
+    for item in obj.items:
+        if len(item.mode) == 5:
+            type = item.mode[0:1]
+        else:
+            type = item.mode[0:2]
+
+        match type: # Determine the type.
+            case b'04': type = "tree"
+            case b'10': type = "blob" # A regular file.
+            case b'12': type = "blob" # A symlink. Blob contents is link target.
+            case b'16': type = "commit" # A submodule
+            case _: raise Exception(f"Weird tree leaf mode {item.mode}")
+
+        if not (recursive and type=='tree'): # This is a leaf
+            print(f"{'0' * (6 - len(item.mode)) + item.mode.decode("ascii")} {type} {item.sha}\t{os.path.join(prefix, item.path)}")
+        else: # This is a branch, recurse
+            ls_tree(repo, item.sha, recursive, os.path.join(prefix, item.path))
+            
+            
+def cmd_checkout(args):
+    repo = repo_find()
+    if not repo:
+        raise Exception("No repository found.")
+    obj = object_read(repo, object_find(repo, args.commit))
+    if obj == None:
+        raise Exception(f"Object {args.commit} not found in repository {repo.gitdir}")
+    
+    # If the object is a commit, we grab its tree
+    if isinstance(obj, GitCommit):
+        obj = object_read(repo, obj.kvlm[b'tree'].decode("ascii"))
+
+    # Verify that path is an empty directory
+    if os.path.exists(args.path):
+        if not os.path.isdir(args.path):
+            raise Exception(f"Not a directory {args.path}!")
+        if os.listdir(args.path):
+            raise Exception(f"Not empty {args.path}!")
+    else:
+        os.makedirs(args.path)
+
+    tree_checkout(repo, obj, os.path.realpath(args.path))           
+
+def tree_checkout(repo, tree, path):
+    for item in tree.items:
+        obj = object_read(repo, item.sha)
+        dest = os.path.join(path, item.path)
+
+        if isinstance(obj, GitTree):
+            os.mkdir(dest)
+            tree_checkout(repo, obj, dest)
+        elif isinstance(obj, GitBlob):
+            # @TODO Support symlinks (identified by mode 12****)
+            with open(dest, 'wb') as f:
+                f.write(obj.blobdata)
 
 # Argument parser
+# ---------------------------------------
 argparser = argparse.ArgumentParser(description="The stupidest content tracker")
 argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
 argsubparsers.required = True
+# init command
 argsp = argsubparsers.add_parser("init", help="Initialize a new, empty repository.")
 argsp.add_argument("path",
                    metavar="directory",
                    nargs="?",
                    default=".",
                    help="Where to create the repository.")
-
+# cat-file command
 argsp = argsubparsers.add_parser("cat-file",
                                  help="Provide content of repository objects")
 
@@ -402,7 +597,7 @@ argsp.add_argument("type",
 argsp.add_argument("object",
                    metavar="object",
                    help="The object to display")
-
+# hash-object command
 argsp = argsubparsers.add_parser(
     "hash-object",
     help="Compute object ID and optionally creates a blob from a file")
@@ -422,6 +617,35 @@ argsp.add_argument("-w",
 argsp.add_argument("path",
                    help="Read object from <file>")
 
+
+# log command
+argsp = argsubparsers.add_parser("log", help="Display history of a given commit.")
+argsp.add_argument("commit",
+                   default="HEAD",
+                   nargs="?",
+                   help="Commit to start at.")
+
+
+# tree command
+argsp = argsubparsers.add_parser("ls-tree", help="Pretty-print a tree object.")
+argsp.add_argument("-r",
+                   dest="recursive",
+                   action="store_true",
+                   help="Recurse into sub-trees")
+
+argsp.add_argument("tree",
+                   help="A tree-ish object.")
+
+# checkout command
+argsp = argsubparsers.add_parser("checkout", help="Checkout a commit inside of a directory.")
+
+argsp.add_argument("commit",
+                   help="The commit or tree to checkout.")
+
+argsp.add_argument("path",
+                   help="The EMPTY directory to checkout on.")
+
+# main 
 def main(argv=sys.argv[1:]):
     args = argparser.parse_args(argv)
     match args.command:
