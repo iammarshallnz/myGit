@@ -1,0 +1,1 @@
+A simple version of git created via following https://github.com/thblt/write-yourself-a-git
